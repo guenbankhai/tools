@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Monitor</title>
+<style>
+:root { /*PALETTE*/ color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 20px; background: var(--background); color: var(--text); font: 13px/1.5 ui-monospace, Consolas, monospace; }
+main { border: 1px solid var(--wire); border-radius: 14px; overflow: hidden; max-width: 1800px; margin: auto; }
+header, footer, .toolbar { padding: 16px 20px; }
+header { background: var(--panel); border-bottom: 1px solid var(--wire); }
+h1 { font-size: 18px; margin: 0 0 4px; }
+#project, #logs { overflow-wrap: anywhere; }
+#connection { float: right; color: var(--unknown); font-size: 12px; }
+#quotas { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
+.quota-group { display: flex; flex-wrap: wrap; gap: 8px 28px; }
+.quota { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.track { display: inline-block; width: 80px; height: 7px; background: var(--background); border: 1px solid currentColor; border-radius: 3px; overflow: hidden; }
+.fill { height: 100%; background: currentColor; }
+.small { color: var(--unknown); font-size: 11px; }
+.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; border-bottom: 1px solid var(--panel); }
+button { background: var(--panel); color: var(--text); border: 1px solid var(--wire); border-radius: 5px; padding: 6px 10px; font: inherit; cursor: pointer; }
+button[aria-pressed="true"] { background: var(--text); color: var(--background); }
+button:focus-visible { outline: 2px solid var(--input); outline-offset: 3px; }
+#legend { display: flex; flex-wrap: wrap; gap: 14px; margin-left: auto; }
+.canvas { overflow-x: auto; min-height: 200px; }
+svg { display: block; margin-inline: auto; }
+.wire { fill: none; stroke: var(--wire); stroke-width: 2; }
+.node rect.card { fill: var(--panel); stroke: currentColor; stroke-width: 1.8; }
+.node text { fill: var(--text); font-size: 12px; }
+.node .name { fill: currentColor; font-size: 15px; font-weight: bold; }
+.node .muted { fill: var(--unknown); font-size: 11px; }
+.mix-track { fill: var(--background); }
+.completed { border-top: 1px solid var(--wire); }
+.completed h2 { margin: 12px 20px; font-size: 14px; }
+.completed-scroll { max-height: calc(6 * 34px); overflow: auto; }
+.completed table { border-collapse: separate; border-spacing: 0; width: 100%; text-align: left; white-space: nowrap; }
+.completed th, .completed td { height: 34px; padding: 6px 12px; line-height: 20px; border-bottom: 1px solid var(--panel); }
+.completed th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+footer { border-top: 1px solid var(--wire); }
+#summary { font-weight: bold; margin-bottom: 6px; }
+#warnings { color: var(--yellow); margin: 8px 0 0; padding-left: 20px; }
+@media (max-width: 650px) { body { padding: 8px; } header, footer, .toolbar { padding: 12px; } #legend { margin-left: 0; } }
+</style>
+<main>
+  <header>
+    <span id="connection" role="status">Connecting</span>
+    <h1>Agent Monitor</h1>
+    <div id="project">Waiting for project data</div>
+    <div class="small">Passive observation · Source-backed usage · No model calls</div>
+    <div id="quotas"></div>
+  </header>
+  <div class="toolbar">
+    <span>Layout</span>
+    <button id="horizontal" type="button" aria-pressed="false">Horizontal</button>
+    <button id="vertical" type="button" aria-pressed="true">Vertical</button>
+    <span class="small">Gray links show ancestry. Arrows show activity: down to process, back to return.</span>
+    <div id="legend"></div>
+  </div>
+  <div class="canvas">
+    <svg id="graph" width="400" height="200" role="img" aria-label="Agent hierarchy and activity directions">
+      <g id="wires"></g><g id="nodes"></g><g id="transfers"></g>
+      <text id="empty" x="28" y="45" fill="var(--unknown)">Waiting for agent sessions</text>
+    </svg>
+  </div>
+  <section class="completed" aria-labelledby="completed-title">
+    <h2 id="completed-title">Completed (0)</h2>
+    <div class="completed-scroll" tabindex="0" role="region" aria-label="Completed and unknown agents">
+      <table>
+        <thead><tr><th scope="col">Agent</th><th scope="col">Model</th><th scope="col">Total tokens</th><th scope="col">Input</th><th scope="col">Cache read</th><th scope="col">Cache write</th><th scope="col">Output</th></tr></thead>
+        <tbody id="completed-rows"></tbody>
+      </table>
+    </div>
+  </section>
+  <footer>
+    <div id="summary">Waiting for usage data</div>
+    <div class="small">Token bars show the mix of known tokens, not task progress. Elapsed time is a source-observed span, not CPU time.</div>
+    <div id="logs" class="small">Logs: Unavailable</div>
+    <ul id="warnings"></ul>
+  </footer>
+</main>
+<script src="/graph.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const svgNS = 'http://www.w3.org/2000/svg';
+const nodeElements = new Map(), wireElements = new Map(), transferElements = new Map();
+let currentView, orientation = 'Vertical', animationFrame = 0;
+function svgElement(tag, attributes, parent) {
+  const element = document.createElementNS(svgNS, tag);
+  for (const [name, value] of Object.entries(attributes)) element.setAttribute(name, value);
+  parent.appendChild(element); return element;
+}
+function prune(elements, ids) {
+  for (const [id, item] of elements) if (!ids.has(id)) { (item.group ?? item.element ?? item).remove(); elements.delete(id); }
+}
+function fit(value, limit = 40) {
+  const text = String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
+  const characters = Array.from(text);
+  return characters.length <= limit ? text : characters.slice(0, limit - 1).join('') + '…';
+}
+function drawNode(node, position) {
+  let item = nodeElements.get(node.id);
+  if (!item) {
+    const group = svgElement('g', {}, $('nodes'));
+    item = { group, card: svgElement('rect', { class: 'card', rx: 12 }, group), labels: [], bars: [] };
+    item.title = svgElement('title', {}, group);
+    for (let index = 0; index < 9; index++) item.labels.push(svgElement('text', { x: 16 }, group));
+    item.track = svgElement('rect', { x: 16, y: 147, width: 300, height: 8, rx: 3, class: 'mix-track' }, group);
+    for (let index = 0; index < 4; index++) item.bars.push(svgElement('rect', { y: 147, height: 8 }, group));
+    nodeElements.set(node.id, item);
+  }
+  item.group.setAttribute('transform', `translate(${position.x} ${position.y})`);
+  item.group.setAttribute('class', 'node');
+  item.group.style.color = node.color;
+  item.card.setAttribute('width', position.width); item.card.setAttribute('height', position.height);
+  const usage = node.usageSegments;
+  const lines = [node.nameLabel, `[${node.idLabel ?? node.sourceId ?? node.id}] ${node.statusLabel} · ${node.elapsedLabel}`,
+    node.modelLabel, `Activity: ${node.activity || 'Unknown'} · ${node.activityElapsedLabel}`, node.detail || '',
+    `Tokens: ${node.tokenLabel}`, `${usage[0].label} ${usage[0].valueLabel} · ${usage[1].label} ${usage[1].valueLabel}`,
+    `${usage[2].label} ${usage[2].valueLabel} · ${usage[3].label} ${usage[3].valueLabel}`, 'Known token mix'];
+  const rows = [26, 47, 67, 91, 112, 135, 179, 199, 165];
+  lines.forEach((line, index) => {
+    const label = item.labels[index], text = fit(line);
+    if (index === 6 || index === 7) {
+      const pair = usage.slice((index - 6) * 2, (index - 6) * 2 + 2);
+      const split = `${pair[0].label} ${pair[0].valueLabel}`.length;
+      label.replaceChildren();
+      svgElement('tspan', { fill: pair[0].color }, label).textContent = text.slice(0, split);
+      svgElement('tspan', {}, label).textContent = text.slice(split, split + 3);
+      svgElement('tspan', { fill: pair[1].color }, label).textContent = text.slice(split + 3);
+    } else label.textContent = text;
+    label.setAttribute('y', rows[index]);
+    label.setAttribute('class', index === 0 ? 'name' : index === 2 || index === 4 || index === 8 ? 'muted' : '');
+  });
+  item.title.textContent = [`ID: ${node.id}`, `Source ID: ${node.sourceId}`, ...lines].join('\n');
+  let x = 16;
+  usage.forEach((segment, index) => {
+    const bar = item.bars[index], width = Math.max(0, (segment.fraction ?? 0) * 300);
+    bar.setAttribute('x', x); bar.setAttribute('width', width); bar.setAttribute('fill', segment.color);
+    x += width;
+  });
+}
+function drawCompleted(nodes) {
+  const unknownCount = nodes.filter(node => !node.completed).length;
+  $('completed-title').textContent = `Completed (${nodes.length - unknownCount})${unknownCount ? ` · Unknown (${unknownCount})` : ''}`;
+  $('completed-rows').replaceChildren();
+  for (const node of nodes) {
+    const row = document.createElement('tr');
+    row.setAttribute('title', `ID: ${node.id}\nSource ID: ${node.sourceId}`);
+    const suffix = node.status === 'Unknown' ? ' (Unknown)'
+      : node.status === 'Idle' && node.modelLabel === 'Unknown model' ? ' (Unknown model)' : '';
+    const name = `${node.nameLabel}${suffix}`;
+    const values = [name, node.modelLabel, node.tokenLabel, ...node.usageSegments.map(segment => segment.valueLabel)];
+    for (const [index, value] of values.entries()) {
+      const cell = document.createElement('td'); cell.textContent = value;
+      if (index < 2) cell.style.color = node.color;
+      else if (index > 2) cell.style.color = node.usageSegments[index - 3].color;
+      row.appendChild(cell);
+    }
+    $('completed-rows').appendChild(row);
+  }
+  if (!nodes.length) {
+    const row = document.createElement('tr'), cell = document.createElement('td');
+    cell.setAttribute('colspan', 7); cell.className = 'small'; cell.textContent = 'No completed agents';
+    row.appendChild(cell); $('completed-rows').appendChild(row);
+  }
+}
+function drawQuotas(quotas) {
+  $('quotas').replaceChildren();
+  for (const quota of quotas) {
+    // One line per provider; its windows wrap onto separate lines when the header is narrow.
+    const group = document.createElement('div'); group.className = 'quota-group'; $('quotas').appendChild(group);
+    for (const window of quota.windows) {
+      const row = document.createElement('div'); row.className = 'quota'; row.style.color = window.color;
+      const label = document.createElement('strong'); label.textContent = `${quota.label} ${window.label}`;
+      const track = document.createElement('span'); track.className = 'track';
+      const fill = document.createElement('div'); fill.className = 'fill';
+      fill.style.width = `${window.percent == null ? 0 : Math.max(0, Math.min(100, window.percent))}%`; track.appendChild(fill);
+      const value = document.createElement('span'); value.textContent = window.percentLabel;
+      const detail = document.createElement('span'); detail.className = 'small'; detail.textContent = [window.resetLabel, window.ageLabel].filter(Boolean).join(' · ');
+      row.append(label, track, value, detail); group.appendChild(row);
+    }
+  }
+}
+function routeTransfer(from, to) {
+  const queue = [{ id: from, route: [] }], visited = new Set([from]);
+  for (let index = 0; index < queue.length; index++) {
+    const current = queue[index];
+    if (current.id === to) return current.route;
+    for (const edge of currentView.edges) {
+      const next = edge.from === current.id ? edge.to : edge.to === current.id ? edge.from : null;
+      if (next == null || visited.has(next)) continue;
+      const wire = wireElements.get(JSON.stringify([edge.from, edge.to]));
+      if (!wire) continue;
+      visited.add(next); queue.push({ id: next, route: [...current.route, { wire, reverse: edge.to === current.id }] });
+    }
+  }
+  return [];
+}
+function animateTransfers() {
+  animationFrame = 0;
+  const now = Date.now();
+  let expired = false;
+  for (const [id, item] of transferElements) {
+    const { flow } = item, duration = flow.duration, at = Date.parse(flow.at), elapsed = now - at;
+    const until = flow.until == null ? Infinity : Date.parse(flow.until);
+    if (now >= until + duration) { item.group.remove(); transferElements.delete(id); expired = true; continue; }
+    const route = routeTransfer(flow.from, flow.to);
+    if (!route.length) { item.group.setAttribute('display', 'none'); continue; }
+    item.group.setAttribute('display', '');
+    const lengths = route.map(step => step.wire.getTotalLength());
+    const length = lengths.reduce((sum, length) => sum + length, 0);
+    const first = Math.max(0, Math.floor((elapsed - duration) / flow.spawnInterval) + 1);
+    const last = Math.min(Math.floor(elapsed / flow.spawnInterval), Math.ceil((until - at) / flow.spawnInterval) - 1);
+    const visible = new Set();
+    for (let ordinal = first; ordinal <= last; ordinal++) {
+      const progress = (elapsed - ordinal * flow.spawnInterval) / duration;
+      let arrow = item.arrows.get(ordinal);
+      if (!arrow) {
+        arrow = svgElement('path', { d: 'M -6 -4 L 6 0 L -6 4 Z' }, item.group);
+        item.arrows.set(ordinal, arrow);
+      }
+      visible.add(ordinal); arrow.setAttribute('fill', flow.color);
+      let distance = length * progress, index = 0;
+      while (index < route.length - 1 && distance > lengths[index]) { distance -= lengths[index]; index++; }
+      const { wire, reverse } = route[index], offset = reverse ? lengths[index] - distance : distance;
+      const point = wire.getPointAtLength(offset);
+      const before = wire.getPointAtLength(Math.max(0, offset - 1));
+      const after = wire.getPointAtLength(Math.min(lengths[index], offset + 1));
+      const sign = reverse ? -1 : 1;
+      const angle = Math.atan2(sign * (after.y - before.y), sign * (after.x - before.x)) * 180 / Math.PI;
+      arrow.setAttribute('transform', `translate(${point.x} ${point.y}) rotate(${angle})`);
+    }
+    prune(item.arrows, visible);
+  }
+  if (expired) drawTree(currentView, now);
+  if (transferElements.size) animationFrame = requestAnimationFrame(animateTransfers);
+}
+function drawTree(view, now) {
+  const returning = new Set(view.flows.filter(flow => now >= Date.parse(flow.at)
+    && (flow.until == null || now < Date.parse(flow.until) + flow.duration)).flatMap(flow => [flow.from, flow.to]));
+  const order = [...view.nodes].sort((a, b) => Number(b.status === 'Running') - Number(a.status === 'Running')
+    || (b.usage.total ?? -1) - (a.usage.total ?? -1));
+  const unknown = node => node.status === 'Unknown' || (node.status === 'Idle' && node.modelLabel === 'Unknown model');
+  const archived = node => node.archived || node.completed || unknown(node);
+  const treeNodes = order.filter(node => !unknown(node) && (!archived(node) || returning.has(node.id)));
+  const treeIds = new Set(treeNodes.map(node => node.id));
+  const tree = { nodes: treeNodes, roots: treeNodes.filter(node => !treeIds.has(node.parentId)).map(node => node.id),
+    edges: view.edges.filter(edge => treeIds.has(edge.from) && treeIds.has(edge.to)) };
+  drawCompleted(order.filter(node => archived(node) && !treeIds.has(node.id))
+    .sort((a, b) => Number(b.completed) - Number(a.completed)));
+  const layout = AgentMonitorGraph.layoutGraph(tree, orientation);
+  const byId = new Map(view.nodes.map(node => [node.id, node]));
+  for (const position of layout.nodes) drawNode(byId.get(position.id), position);
+  prune(nodeElements, new Set(layout.nodes.map(node => node.id)));
+  for (const link of layout.wires) {
+    let wire = wireElements.get(link.key);
+    if (!wire) { wire = svgElement('path', { class: 'wire' }, $('wires')); wireElements.set(link.key, wire); }
+    wire.setAttribute('d', link.path);
+  }
+  prune(wireElements, new Set(layout.wires.map(wire => wire.key)));
+  $('graph').setAttribute('width', layout.width); $('graph').setAttribute('height', layout.height);
+  $('graph').setAttribute('viewBox', `0 0 ${layout.width} ${layout.height}`);
+  $('empty').textContent = treeNodes.length ? '' : view.nodes.length ? 'No active agents' : 'No agent sessions found. Waiting for source events.';
+}
+function draw(view) {
+  currentView = view;
+  $('project').textContent = view.project || 'Unknown project';
+  drawQuotas(view.quotas);
+  drawTree(view, Date.now());
+  $('summary').textContent = `Total tokens: ${view.totals.label}${view.totals.partial ? ' known (partial)' : ''} · Usage ${view.totals.coverage.total}/${view.totals.nodeCount} agents · Roots ${view.roots.length} · Completed ${view.completedCount}`;
+  $('logs').textContent = `Logs: ${view.logDir || 'Unavailable'}`;
+  $('warnings').replaceChildren();
+  for (const warning of view.warnings) { const item = document.createElement('li'); item.textContent = warning; $('warnings').appendChild(item); }
+  $('legend').replaceChildren();
+  const models = new Map(view.nodes.map(node => [node.modelLabel, node.color]));
+  for (const [model, color] of models) { const label = document.createElement('span'); label.style.color = color; label.textContent = `● ${model}`; $('legend').appendChild(label); }
+  for (const flow of view.flows) {
+    let item = transferElements.get(flow.id);
+    if (!item) { item = { group: svgElement('g', {}, $('transfers')), arrows: new Map() }; transferElements.set(flow.id, item); }
+    item.flow = flow;
+  }
+  prune(transferElements, new Set(view.flows.map(flow => flow.id)));
+  if (!transferElements.size && animationFrame) { cancelAnimationFrame(animationFrame); animationFrame = 0; }
+  if (!animationFrame && transferElements.size) animateTransfers();
+}
+for (const value of ['Horizontal', 'Vertical']) $('' + value.toLowerCase()).addEventListener('click', () => {
+  orientation = value;
+  $('horizontal').setAttribute('aria-pressed', value === 'Horizontal');
+  $('vertical').setAttribute('aria-pressed', value === 'Vertical');
+  if (currentView) draw(currentView);
+});
+const events = new EventSource('/events');
+events.onmessage = event => {
+  try { draw(JSON.parse(event.data)); $('connection').textContent = 'Connected'; $('connection').style.color = 'var(--green)'; }
+  catch (error) { $('connection').textContent = 'Invalid monitor data'; $('connection').style.color = 'var(--red)'; }
+};
+events.onerror = () => { $('connection').textContent = 'Disconnected'; $('connection').style.color = 'var(--red)'; };
+</script>
+</html>

@@ -1,0 +1,6 @@
+.log/
+.inbox/
+node_modules/
+.DS_Store
+Thumbs.db
+Desktop.ini
